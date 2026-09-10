@@ -1,0 +1,25 @@
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# third-party assets placed by the user (see README, "Requirements")
+third_party
+ckpt
+data/mano
+# released ACE-Ego-Hand weights (see README, "Download checkpoints")
+checkpoints
+
+# datasets, caches and run outputs
+datasets/
+data_json/
+cache/
+results/
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
