@@ -13,6 +13,12 @@ its own fitted pinhole is written to the output as ``pred_intrinsics``.
 One pickle is written for the whole clip; ``--split_segments`` reproduces the
 benchmark 81-frame dump format instead.
 
+Both hand slots are regressed on every frame, so whether a hand is there is a
+decision this script makes: a hand is claimed in a frame iff its in-frame
+presence ``exists_2d > 0.5``. The decision is written as ``claim`` and every
+pose array is NaN where it is False; ``exists_2d`` / ``exists_3d`` are kept
+ungated so the decision can be redone.
+
 Only pinhole cameras are supported: undistort fisheye footage first.
 
   python infer_video.py --video clip.mp4 \
@@ -45,9 +51,15 @@ from ace_ego_hand.video_vae import decode_video, encode, frame_count, load_vae  
 _GRID = 32
 
 
-def _encode_size(w: int, h: int, target_w: int | None) -> tuple[int, int]:
-    """Frame size to encode at: keep the aspect, snap both axes to the VAE grid."""
-    tw = target_w or w
+def _encode_size(w: int, h: int, max_w: int | None) -> tuple[int, int]:
+    """Frame size to encode at: keep the aspect, snap both axes to the VAE grid.
+
+    Frames wider than ``max_w`` are downscaled to it; narrower ones keep their
+    native size. Upscaling puts the hands on a canvas the model was not trained
+    on and biases depth (measured: ARCTIC 672x480 upscaled to 832 wide, the K
+    model's absolute MPJPE is 81 mm vs 23 mm at native size).
+    """
+    tw = min(w, max_w) if max_w else w
     s = tw / float(w)
     ew = max(_GRID, int(round(w * s / _GRID)) * _GRID)
     eh = max(_GRID, int(round(h * s / _GRID)) * _GRID)
@@ -75,7 +87,8 @@ def main() -> None:
                          "full: one forward over the clip (RoPE extrapolation)")
     ap.add_argument("--tile_w", type=int, default=22)
     ap.add_argument("--encode_w", type=int, default=832,
-                    help="rescale frames to this width before the VAE; 0 keeps native")
+                    help="downscale frames wider than this before the VAE; narrower "
+                         "frames are never upscaled. 0 keeps native")
     ap.add_argument("--max_frames", type=int, default=0, help="0 = whole video")
     ap.add_argument("--split_segments", action="store_true",
                     help="write one pkl per 81-frame segment (the benchmark dump "
@@ -90,10 +103,9 @@ def main() -> None:
     if n_src <= 0:
         raise SystemExit(f"{args.video}: could not read a frame count")
     n_frames = min(n_src, args.max_frames) if args.max_frames else n_src
-    # the causal VAE consumes 4k+1 pixel frames; trim the tail rather than pad
-    n_frames = 4 * ((n_frames - 1) // 4) + 1
-    if n_frames < 5:
-        raise SystemExit(f"{args.video}: need at least 5 frames, got {n_frames}")
+    # the causal VAE consumes 4k+1 (>= 5) pixel frames: pad by repeating the last
+    # frame and drop the padded predictions afterwards, so every real frame is kept
+    n_enc = max(5, 4 * ((n_frames + 2) // 4) + 1)
 
     cap = cv2.VideoCapture(args.video)
     src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -101,7 +113,8 @@ def main() -> None:
     cap.release()
     enc_w, enc_h = _encode_size(src_w, src_h, args.encode_w or None)
     print(f"[video] {args.video}  {src_w}x{src_h}  {n_src} frames "
-          f"-> encoding {n_frames} at {enc_w}x{enc_h}")
+          f"-> predicting {n_frames} at {enc_w}x{enc_h}"
+          + (f" ({n_enc - n_frames} padded)" if n_enc > n_frames else ""))
 
     if args.camera and args.intrinsics:
         raise SystemExit("pass either --camera or --intrinsics, not both")
@@ -162,6 +175,8 @@ def main() -> None:
 
     vae = load_vae(device)
     pixels = decode_video(args.video, n_frames, resize_hw=(enc_w, enc_h))
+    if n_enc > n_frames:
+        pixels = torch.cat([pixels, pixels[-1:].repeat(n_enc - n_frames, 1, 1, 1)])
     ctrl = encode(vae, pixels, device).float()
     del vae, pixels
     if device.type == "cuda":
@@ -173,24 +188,43 @@ def main() -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(args.video).stem
-    f_use = len(pred["global_orient"])
+    f_use = n_frames                    # predictions on padded frames are dropped
+    if len(pred["global_orient"]) < f_use:
+        raise RuntimeError(f"predicted {len(pred['global_orient'])} < {f_use} frames")
+
+    # exists_2d is the in-frame head: is this hand visible in THIS frame. That is
+    # the question presence answers, so that is what the gate reads. (exists_3d
+    # also stays on for hands that are occluded or have left the frame.)
+    claim = np.asarray(pred["exists_2d"][:f_use]) > 0.5           # (F, 2) bool
+    n_on = claim.sum(0)
+    print(f"[presence] left claimed on {n_on[0]}/{f_use} frames, "
+          f"right on {n_on[1]}/{f_use}")
 
     def _pack(idx: np.ndarray) -> dict:
         rec = {k: pred[k][idx].astype(np.float32) for k in DUMP_KEYS}
         n = len(idx)
+        on = claim[idx]                                            # (n, 2)
+
+        def gate(a: np.ndarray) -> np.ndarray:
+            """NaN the unclaimed rows, so ignoring `claim` fails loudly."""
+            return np.where(on.reshape((n, 2) + (1,) * (a.ndim - 2)),
+                            a, np.float32("nan"))
+
         return {
-            "go": rec["global_orient"].reshape(n, 2, 1, 3, 3),
-            "hp": rec["hand_pose"],
-            "betas": rec["betas"],
-            "cam_trans": rec["cam_trans"],
+            "go": gate(rec["global_orient"].reshape(n, 2, 1, 3, 3)),
+            "hp": gate(rec["hand_pose"]),
+            "betas": gate(rec["betas"]),
+            "cam_trans": gate(rec["cam_trans"]),
             # no ground truth here: slots are fixed, slot 0 = left, slot 1 = right
             "is_right": np.tile(np.array([[0.0, 1.0]], np.float32), (n, 1)),
-            # and presence comes from the model's own head, not a GT track
+            # the presence decision; every pose array is NaN where it is False
+            "claim": on,
+            # the raw presence heads, ungated
             "exists_2d": rec["exists_2d"],
             "exists_3d": rec["exists_3d"],
-            "joints_2d": rec["direct_joints2d"],
-            "joints_cam_direct": rec["direct_joints_cam"],
-            "wrist_cam_direct": rec["direct_wrist_cam"],
+            "joints_2d": gate(rec["direct_joints2d"]),
+            "joints_cam_direct": gate(rec["direct_joints_cam"]),
+            "wrist_cam_direct": gate(rec["direct_wrist_cam"]),
             "intrinsics": intr,
             # K-free: the effective pinhole fitted from the ray field the model
             # predicted off the image. This -- not `intrinsics` -- is the camera
@@ -202,10 +236,11 @@ def main() -> None:
         # benchmark dump format: one pkl per 81-frame segment. The 81 comes from
         # the training window (21 latent frames -> 4*(21-1)+1 px), and the
         # evaluator consumes segments -- it is a file convention, not a limit on
-        # the forward pass, which already ran over the whole clip above.
-        n_seg = max(1, f_use // 81)
+        # the forward pass, which already ran over the whole clip above. The
+        # last segment holds the remaining frames and may be shorter than 81.
+        n_seg = (f_use + 80) // 81
         for i in range(n_seg):
-            idx = np.minimum(np.arange(81 * i, 81 * i + 81), f_use - 1)
+            idx = np.arange(81 * i, min(81 * i + 81, f_use))
             with open(out_dir / f"{stem}_seg_{i:03d}.pkl", "wb") as f:
                 pickle.dump(_pack(idx), f)
         print(f"[done] {n_seg} segment pkl(s) -> {out_dir}")

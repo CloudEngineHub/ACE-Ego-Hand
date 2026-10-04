@@ -97,6 +97,9 @@ python infer_video.py --video clip.mp4 --camera cam.json \
     --out results/clip
 ```
 
+Frames wider than 832 px are downscaled to 832; narrower videos are encoded at
+their native size, never upscaled (`--encode_w` sets the cap).
+
 `cam.json` looks like this — intrinsics are taken as constant over the clip, in
 the calibration's own pixel grid, and are rescaled automatically if the video
 resolution differs (`--intrinsics fx,fy,cx,cy` is an inline shorthand):
@@ -106,9 +109,11 @@ resolution differs (`--intrinsics fx,fy,cx,cy` is an inline shorthand):
  "frames": [{"intrinsics": {"fx": 736.6, "fy": 736.6, "cx": 640.0, "cy": 360.0}}]}
 ```
 
-The predictions land in one pickle per clip. To see them, render an overlay
-(`--mesh` shades the MANO mesh through a built-in CPU rasterizer, so no GPU
-renderer is needed):
+The predictions land in one pickle per clip. `claim` (F, 2) marks the frames
+where each hand is visible (`exists_2d > 0.5`); pose arrays are `NaN` elsewhere.
+
+To see them, render an overlay (`--mesh` shades the MANO mesh through
+a built-in CPU rasterizer, so no GPU renderer is needed):
 
 ```bash
 python scripts/viz_preds.py --pred_dir results/clip --video clip.mp4 \

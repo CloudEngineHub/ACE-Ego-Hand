@@ -4,8 +4,8 @@
 Reads the pkl(s) infer_video.py wrote for a clip (one whole-clip <stem>.pkl, or
 <stem>_seg_<NNN>.pkl from --split_segments), runs the MANO forward on the
 predicted parameters, projects the camera-space joints and draws the two hands
-over the source video (left blue, right pink). Hands gated off by the presence
-head are not drawn.
+over the source video (left blue, right pink). Hands the dump does not claim
+are not drawn; their parameters are NaN in the pkl.
 
   python scripts/viz_preds.py --pred_dir results/clip --video clip.mp4 \
       --out results/clip_viz --mesh
@@ -72,13 +72,20 @@ def mano_cam_joints(pred: dict, mano_models: dict, device: str,
     F = pred["cam_trans"].shape[0]
     out = np.zeros((F, 2, 21, 3), np.float32)
     verts = np.zeros((F, 2, 778, 3), np.float32) if want_verts else None
+    # unclaimed rows are NaN: run them through MANO as zeros (they are never
+    # drawn) and put the NaN back on the output
+    def arr(key: str, slot: int) -> np.ndarray:
+        return np.nan_to_num(np.asarray(pred[key][:, slot], np.float32))
+
     with torch.no_grad():
         for slot, is_right in ((0, False), (1, True)):
-            go = torch.from_numpy(pred["go"][:, slot]).float().reshape(F, 3, 3).to(device)
-            hp = torch.from_numpy(pred["hp"][:, slot]).float().to(device)
-            betas = torch.from_numpy(pred["betas"][:, slot]).float().to(device)
+            go = torch.from_numpy(arr("go", slot)).reshape(F, 3, 3).to(device)
+            hp = torch.from_numpy(arr("hp", slot)).to(device)
+            betas = torch.from_numpy(arr("betas", slot)).to(device)
             j21, v = mano_forward_batch_full(go, hp, betas, mano_models[is_right])
-            trans = pred["cam_trans"][:, slot][:, None, :]
+            bad = ~np.isfinite(pred["cam_trans"][:, slot]).all(-1)
+            trans = np.where(bad[:, None], np.float32("nan"),
+                             pred["cam_trans"][:, slot])[:, None, :]
             out[:, slot] = j21.cpu().numpy() + trans
             if want_verts:
                 verts[:, slot] = v.cpu().numpy() + trans
@@ -203,11 +210,19 @@ def render_video(item: dict, pred: dict, gt_pack: dict, draw_gt: bool,
     pj3d, pverts = mano_cam_joints(pred, mano_models, device, want_verts=mesh)
     pj2d, pz = project(pj3d, intr, frame_w, frame_h)
     pv2d = project(pverts, intr, frame_w, frame_h)[0] if mesh else None
+    # the dump's own presence decision; dumps without `claim` fall back to
+    # exists_2d, the in-frame head it is derived from. Not exists_3d: that head
+    # stays on for hands that are occluded or have left the frame.
+    if "claim" in pred:
+        p_show = np.asarray(pred["claim"], bool)
+    else:
+        p_show = pred["exists_2d"] > 0.5
     if use_joints2d:
         pj2d = pred["joints_2d"] * np.array([frame_w, frame_h], np.float32)
-        p_show = pred["exists_2d"] > 0.5   # 2D head gates on 2D presence only
     else:
-        p_show = (pred["exists_3d"] > 0.5) & (pz.mean(-1) > 0.05)
+        # projected-MANO branch: also require a sane camera-space depth
+        with np.errstate(invalid="ignore"):
+            p_show = p_show & (pz.mean(-1) > 0.05)
 
     gj2d = g_show = gverts = gv2d = None
     scale = min(1.0, max_w / (frame_w * (2 if gj2d is not None else 1)))
@@ -281,16 +296,17 @@ def main() -> int:
         print(f"no <stem>.pkl or <stem>_seg_<NNN>.pkl files in {pred_dir}")
         return 1
 
+    # only the dump of --video itself: other clips' pkls in the same dir were
+    # predicted on different footage and must not be drawn over this one
     stem0 = Path(args.video).stem
-    items = {s: {"control_file_path": _abspath(args.video), "video_id": s}
-             for s in list(segs) + list(whole)}
-    if stem0 not in items:
+    if stem0 not in segs and stem0 not in whole:
         print(f"no pkl matching {stem0!r} in {pred_dir}")
         return 1
+    items = {stem0: {"control_file_path": _abspath(args.video), "video_id": stem0}}
     mano_models, _ = init_mano_and_renderer(device=args.device)
 
     n_done = 0
-    for stem in sorted(set(segs) | set(whole)):
+    for stem in items:
         if args.limit and n_done >= args.limit:
             break
         item = items[stem]
